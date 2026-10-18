@@ -73,6 +73,15 @@ edr-lite.exe --config C:\edr\agent.toml --test
 edr-lite.exe --config C:\edr\agent.toml
 ```
 
+### 릴레이 VM에서 직접 해야 하는 작업
+
+1. Python 3.11 이상과 google-cloud-logging을 설치합니다 (edr-relay/requirements.txt).
+2. relay.py, relay.toml, allowed_cn.txt를 배치하고, gen-certs.sh로 만든 인증서를 지정합니다.
+3. GCP 서비스 계정 키를 놓고 GOOGLE_APPLICATION_CREDENTIALS로 지정합니다. 이 키는 릴레이에만 두고, 파일 접근 권한은 서비스 실행 계정만 읽게 제한합니다.
+4. relay.py를 비특권 계정의 서비스(예: systemd)로 등록해 재부팅 후에도 자동 실행되게 합니다.
+5. 방화벽을 설정합니다. 분석망 쪽 NIC에서는 수집 포트만 열고, 외부 방향은 GCP API(443)만 허용합니다.
+
+
 ## 배포 절차
 
 1. 릴레이 VM에서 인증서를 만든다.
