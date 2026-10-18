@@ -107,4 +107,3 @@ edr-lite.exe --config C:\edr\agent.toml
 ## 문서
 
 - `개발명세서.md`: 소스 구조, 모듈, 스키마, 보안 설계
-- `README.original.md`: 이전 README 백업
