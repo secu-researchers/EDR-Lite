@@ -14,7 +14,7 @@ use crate::event::{
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::kernel_providers::{self, KernelProvider};
 use ferrisetw::provider::Provider;
-use ferrisetw::trace::stop_trace_by_name;
+use ferrisetw::trace::{stop_trace_by_name, TraceTrait};
 use ferrisetw::{EventRecord, KernelTrace, SchemaLocator, GUID};
 use std::collections::HashMap;
 use std::net::IpAddr;
