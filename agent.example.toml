@@ -1,0 +1,19 @@
+# edr-lite 설정 예시 (게스트 VM: C:\edr\agent.toml)
+relay_url   = "https://10.30.0.10:8443/v1/ingest"   # 릴레이 VM. 반드시 https
+session_id  = "run-20261018-001"                    # 에이전트 인증서 CN 과 동일하게
+ca_cert     = 'C:\edr\ca.pem'
+client_cert = 'C:\edr\agent-run-20261018-001.pem'
+client_key  = 'C:\edr\agent-run-20261018-001.key'
+# gen-certs.sh server 실행 시 출력되는 값
+server_cert_sha256 = "6c1de3876cf190ddb8d4769dfafa51c1f65fb2fba266bd5e531690d7220dc695"
+
+# 선택 항목 (기본값)
+# batch_max_events   = 500
+# batch_max_bytes    = 524288
+# flush_interval_ms  = 500      # 랜섬웨어 대비: 죽기 직전 로그까지 빨리 내보냄
+# queue_capacity     = 50000
+# heartbeat_secs     = 10       # 릴레이는 3*이 값 이상 끊기면 경보
+# collect_image_loads = true
+# collect_network     = true
+# trace_name = "WindowsTelemetryService"   # 생략 시 회차마다 자동 생성
+# wipe_client_key = true        # 로드 직후 키 파일 삭제 (스냅샷 복원형 워크플로 전제)
