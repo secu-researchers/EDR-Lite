@@ -1,2 +1,5 @@
 /target
 agent.toml
+sa-key*.json
+*-sa-key.json
+*.key
