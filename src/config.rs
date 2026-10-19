@@ -1,5 +1,5 @@
 //! 설정 파일 (TOML) 로드 및 검증.
-//! 보안상 위험한 설정(평문 http, 핀 미설정 등)은 아예 허용하지 않는다.
+//! 보안상 위험한 설정(형식이 잘못된 프로젝트 ID, 허용되지 않은 문자 등)은 아예 허용하지 않는다.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -7,18 +7,16 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// 릴레이 수집 엔드포인트. 반드시 https. 예: "https://10.30.0.10:8443/v1/ingest"
-    pub relay_url: String,
-    /// 이번 분석 회차 ID (릴레이가 인증서 CN 과 대조)
+    /// 로그를 기록할 GCP 프로젝트 ID (EDR 전용 프로젝트)
+    pub gcp_project_id: String,
+    /// Logs Writer 역할만 가진 서비스 계정 키(JSON) 경로
+    pub sa_key_path: PathBuf,
+    /// 이번 분석 회차 ID (모든 이벤트의 sid)
     pub session_id: String,
-    /// 릴레이 서버 인증서를 서명한 사설 CA (PEM). 시스템 루트 저장소는 사용하지 않는다.
-    pub ca_cert: PathBuf,
-    /// 이번 회차용 클라이언트 인증서/키 (PEM)
-    pub client_cert: PathBuf,
-    pub client_key: PathBuf,
-    /// 릴레이 서버 리프 인증서(DER)의 SHA-256 (hex 64자). 사설 CA 가 탈취돼도 MITM 방지.
-    pub server_cert_sha256: String,
 
+    /// Cloud Logging 로그 이름(log_id)
+    #[serde(default = "d_log_name")]
+    pub log_name: String,
     #[serde(default = "d_batch_max")]
     pub batch_max_events: usize,
     #[serde(default = "d_batch_bytes")]
@@ -38,13 +36,14 @@ pub struct Config {
     /// (`logman query -ets` 에 고정 문자열로 노출되지 않도록).
     #[serde(default)]
     pub trace_name: Option<String>,
-    /// true 면 TLS 로딩 직후 client_key 파일을 덮어쓰고 삭제한다.
-    /// 키는 이미 메모리에 올라가 있어 동작에는 지장이 없고, 디스크에서 훔쳐갈 키가 사라진다.
+    /// true 면 서비스 계정 키를 메모리에 올린 직후 키 파일을 덮어쓰고 삭제한다.
+    /// 키는 이미 메모리에 있어 동작에는 지장이 없고, 디스크에서 훔쳐갈 키가 사라진다.
     /// (스냅샷 복원형 워크플로 전제: 재시작하려면 키를 다시 배치)
     #[serde(default)]
-    pub wipe_client_key: bool,
+    pub wipe_sa_key: bool,
 }
 
+fn d_log_name() -> String { "lab_malware".into() }
 fn d_batch_max() -> usize { 500 }
 fn d_batch_bytes() -> usize { 512 * 1024 }
 fn d_flush_ms() -> u64 { 500 }
@@ -62,8 +61,17 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if !self.relay_url.starts_with("https://") {
-            return Err("relay_url 은 https:// 로 시작해야 합니다".into());
+        if !valid_project_id(&self.gcp_project_id) {
+            return Err("gcp_project_id 는 6~30자, 소문자로 시작, [a-z0-9-], 하이픈으로 끝날 수 없습니다".into());
+        }
+        if self.log_name.is_empty()
+            || self.log_name.len() > 100
+            || !self
+                .log_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err("log_name 은 1~100자 [A-Za-z0-9._-] 이어야 합니다".into());
         }
         if self.session_id.is_empty()
             || self.session_id.len() > 64
@@ -74,9 +82,8 @@ impl Config {
         {
             return Err("session_id 는 1~64자 [A-Za-z0-9_-] 이어야 합니다".into());
         }
-        pin_bytes(&self.server_cert_sha256)?;
-        if !(1..=5000).contains(&self.batch_max_events) {
-            return Err("batch_max_events 범위: 1~5000".into());
+        if !(1..=1000).contains(&self.batch_max_events) {
+            return Err("batch_max_events 범위: 1~1000".into());
         }
         if !(4096..=4 * 1024 * 1024).contains(&self.batch_max_bytes) {
             return Err("batch_max_bytes 범위: 4KiB~4MiB".into());
@@ -102,18 +109,13 @@ impl Config {
     }
 }
 
-/// hex 문자열 → 32바이트. ':' 구분자 허용 (openssl 출력 형식).
-pub fn pin_bytes(hex: &str) -> Result<[u8; 32], String> {
-    let cleaned: String = hex.chars().filter(|c| *c != ':' && !c.is_whitespace()).collect();
-    if cleaned.len() != 64 {
-        return Err("server_cert_sha256 은 SHA-256 hex 64자여야 합니다".into());
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in cleaned.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk).map_err(|_| "잘못된 hex")?;
-        out[i] = u8::from_str_radix(s, 16).map_err(|_| "server_cert_sha256 hex 형식 오류")?;
-    }
-    Ok(out)
+/// GCP 프로젝트 ID 형식: 6~30자, 소문자로 시작, 소문자·숫자·하이픈, 하이픈으로 끝나지 않음.
+fn valid_project_id(s: &str) -> bool {
+    let b = s.as_bytes();
+    (6..=30).contains(&b.len())
+        && b[0].is_ascii_lowercase()
+        && b[b.len() - 1] != b'-'
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
 #[cfg(test)]
@@ -123,37 +125,55 @@ mod tests {
     fn base() -> Config {
         toml::from_str(
             r#"
-relay_url = "https://10.30.0.10:8443/v1/ingest"
+gcp_project_id = "edr-lab-123456"
+sa_key_path = "sa-key.json"
 session_id = "run-20261018-001"
-ca_cert = "ca.pem"
-client_cert = "agent.pem"
-client_key = "agent.key"
-server_cert_sha256 = "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89"
 "#,
         )
         .unwrap()
     }
 
     #[test]
-    fn valid_config() {
-        base().validate().unwrap();
+    fn valid_config_and_defaults() {
+        let c = base();
+        c.validate().unwrap();
+        assert_eq!(c.log_name, "lab_malware");
+        assert!(!c.wipe_sa_key);
     }
 
     #[test]
-    fn rejects_http_and_bad_pin_and_unknown_fields() {
-        let mut c = base();
-        c.relay_url = "http://10.30.0.10/".into();
-        assert!(c.validate().is_err());
+    fn rejects_bad_project_id() {
+        for bad in ["Edr-Lab-1", "short", "1edr-lab-123", "edr-lab-123-", "edr_lab_123", ""] {
+            let mut c = base();
+            c.gcp_project_id = bad.into();
+            assert!(c.validate().is_err(), "{bad}");
+        }
+    }
 
+    #[test]
+    fn rejects_bad_names_and_ranges() {
         let mut c = base();
-        c.server_cert_sha256 = "abcd".into();
+        c.log_name = "a/b".into();
         assert!(c.validate().is_err());
 
         let mut c = base();
         c.session_id = "bad id;rm".into();
         assert!(c.validate().is_err());
 
-        let r: Result<Config, _> = toml::from_str("relay_url='https://x'\nproxy='http://evil'");
+        let mut c = base();
+        c.batch_max_events = 1001;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_and_removed_fields() {
+        let r: Result<Config, _> = toml::from_str(
+            "gcp_project_id='edr-lab-123456'\nsa_key_path='k.json'\nsession_id='s'\nproxy='http://evil'",
+        );
+        assert!(r.is_err());
+        let r: Result<Config, _> = toml::from_str(
+            "gcp_project_id='edr-lab-123456'\nsa_key_path='k.json'\nsession_id='s'\nrelay_url='https://x'",
+        );
         assert!(r.is_err());
     }
 }
