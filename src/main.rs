@@ -2,25 +2,28 @@
 //!
 //! 사용법
 //!   edr-lite.exe --config C:\edr\agent.toml            실 운영 (관리자 권한)
-//!   edr-lite.exe --config C:\edr\agent.toml --test     릴레이 연결 테스트만 (ETW 미사용)
+//!   edr-lite.exe --config C:\edr\agent.toml --test     Cloud Logging 전송 테스트만 (ETW 미사용)
 //!   edr-lite.exe --dry-run                             네트워크 없이 이벤트를 stdout 출력
 //!
 //! 설계 원칙
-//!   - 단방향 (수집 → 릴레이). 원격 명령 수신 기능 없음
-//!   - 클라우드 자격증명 없음. 릴레이만 GCP 에 쓸 수 있다
+//!   - 단방향 (수집 → Cloud Logging). 원격 명령 수신 기능 없음
+//!   - 서비스 계정에는 Logs Writer 만 부여한다 (쓰기 전용). 키는 메모리에만 보관한다
 //!   - 게스트는 오염된 환경이라 가정: 에이전트 데이터는 "증거 후보"이지 진실이 아니다
+//!     (키가 유출되면 위조 로그가 들어올 수 있으며, 이는 분석 대상으로 취급한다)
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
+mod auth;
 mod config;
 mod event;
+mod gcp;
 mod sender;
 mod tls;
 #[cfg(windows)]
 mod etw;
 
 use event::{Emitter, EtwHealth, EventBody};
-use sender::{HttpsTransport, SenderOpts, StdoutTransport, Transport};
+use sender::{SenderOpts, StdoutTransport, Transport};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -78,16 +81,16 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         let path = args.config.as_ref().expect("checked");
         let cfg = config::Config::load(path)?;
-        let pin = config::pin_bytes(&cfg.server_cert_sha256)?;
-        let tls = tls::client_config(&cfg.ca_cert, &cfg.client_cert, &cfg.client_key, pin)?;
-        // 키는 TLS 설정에 이미 로드됨 → 요청 시 디스크에서 제거 (인포스틸러가 훔쳐갈 키 제거)
-        if cfg.wipe_client_key {
-            match wipe_file(&cfg.client_key) {
-                Ok(()) => eprintln!("[edr] client_key 디스크에서 삭제됨"),
-                Err(e) => eprintln!("[edr] 경고: client_key 삭제 실패: {e}"),
+        let tls = tls::client_config()?;
+        let agent = gcp::http_agent(tls);
+        let t = gcp::GcpTransport::new(agent, &cfg.gcp_project_id, &cfg.log_name, &cfg.sa_key_path)?;
+        // 키는 메모리에 이미 로드됨 → 요청 시 디스크에서 제거 (인포스틸러가 훔쳐갈 키 제거)
+        if cfg.wipe_sa_key {
+            match wipe_file(&cfg.sa_key_path) {
+                Ok(()) => eprintln!("[edr] 서비스 계정 키 파일 디스크에서 삭제됨"),
+                Err(e) => eprintln!("[edr] 경고: 서비스 계정 키 파일 삭제 실패: {e}"),
             }
         }
-        let t = HttpsTransport::new(cfg.relay_url.clone(), tls);
         (Some(cfg), Box::new(t))
     };
 
@@ -113,7 +116,7 @@ fn run(args: Args) -> Result<(), String> {
         let _ = sender.join();
         let c = &emitter.counters;
         if c.dropped_send.load(Ordering::Relaxed) > 0 {
-            return Err("릴레이 전송 실패 (위 오류 메시지 확인)".into());
+            return Err("Cloud Logging 전송 실패 (위 오류 메시지 확인)".into());
         }
         eprintln!("[edr] 연결 테스트 성공: 이벤트 2건 전송");
         return Ok(());
@@ -165,7 +168,7 @@ fn run(args: Args) -> Result<(), String> {
     let _ = hb.join();
     emitter.emit(EventBody::AgentStop { reason: "signal".into() });
     emitter.shutdown();
-    // 릴레이 장애 시 무한 대기하지 않도록 상한을 둔다
+    // 전송 장애 시 무한 대기하지 않도록 상한을 둔다
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.join();
@@ -213,7 +216,7 @@ mod tests {
     #[test]
     fn wipe_file_zeroes_and_removes() {
         let dir = std::env::temp_dir();
-        let p = dir.join(format!("edr-wipe-test-{}.key", std::process::id()));
+        let p = dir.join(format!("edr-wipe-test-{}.json", std::process::id()));
         std::fs::write(&p, b"SECRETKEYMATERIAL").unwrap();
         wipe_file(&p).unwrap();
         assert!(!p.exists());

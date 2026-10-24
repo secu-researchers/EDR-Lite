@@ -1,11 +1,8 @@
 //! 배치 송신 스레드 + heartbeat 스레드.
-//! - 단방향: 응답 본문은 해석하지 않는다 (릴레이 → 에이전트 명령 채널 없음)
-//! - 프록시 미사용: ureq 는 환경변수 프록시를 명시적으로 켜지 않는 한 쓰지 않는다
-//!   (악성코드가 HTTPS_PROXY 를 설정해 트래픽을 가로채는 것을 방지)
-//! - 리다이렉트 금지
+//! 실제 전송 방식은 `Transport` 구현체가 정한다 (Cloud Logging 직접 전송은 gcp.rs).
 
 use crate::event::{Counters, Emitter, EtwHealth, EventBody, Msg};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -15,44 +12,6 @@ use std::time::{Duration, Instant};
 pub trait Transport: Send {
     /// NDJSON 배치 전송. 실패 시 Err.
     fn send(&mut self, body: &[u8]) -> Result<(), String>;
-}
-
-pub struct HttpsTransport {
-    agent: ureq::Agent,
-    url: String,
-}
-
-impl HttpsTransport {
-    pub fn new(url: String, tls: Arc<rustls::ClientConfig>) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .tls_config(tls)
-            .redirects(0)
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .user_agent("edr-lite/0.1")
-            .build();
-        HttpsTransport { agent, url }
-    }
-}
-
-impl Transport for HttpsTransport {
-    fn send(&mut self, body: &[u8]) -> Result<(), String> {
-        match self
-            .agent
-            .post(&self.url)
-            .set("Content-Type", "application/x-ndjson")
-            .send_bytes(body)
-        {
-            Ok(resp) => {
-                // 연결 재사용을 위해 소량만 읽고 버린다. 내용은 해석하지 않음.
-                let mut sink = Vec::new();
-                let _ = resp.into_reader().take(1024).read_to_end(&mut sink);
-                Ok(())
-            }
-            Err(ureq::Error::Status(code, _)) => Err(format!("relay HTTP {code}")),
-            Err(e) => Err(format!("전송 오류: {e}")),
-        }
-    }
 }
 
 /// --dry-run 용: stdout 에 NDJSON 출력
@@ -163,7 +122,7 @@ pub fn spawn_sender(
         .expect("sender thread spawn")
 }
 
-/// 주기적 heartbeat. 릴레이는 heartbeat 공백으로 에이전트 중단(악성코드에 의한 kill 등)을 탐지한다.
+/// 주기적 heartbeat. 수집 측(Google Function)은 heartbeat 공백으로 에이전트 중단(악성코드에 의한 kill 등)을 탐지한다.
 pub fn spawn_heartbeat(
     emitter: Emitter,
     interval: Duration,
